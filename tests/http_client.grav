@@ -1,0 +1,152 @@
+// apogee-http-client's tests: real requests to a local server (JSON, form,
+// multipart and raw bodies, query strings, headers, tokens, base URLs,
+// redirects, failures, retries with backoff, timeouts, concurrent pools),
+// then the fakes (patterns, sequences, handlers, stray requests, assertions).
+import "std"
+import "std/net"
+import "../src/http_client.grav"
+use apogee.*
+
+class Hits { static flaky: AtomicInt = new AtomicInt(0) }
+
+// A server that echoes what it got, fails on purpose, or is slow.
+fn server() -> HttpServer {
+    let app = new HttpServer()
+    app.any("/echo", fn(req: HttpRequest) -> HttpResponse {
+        let o = Json.object()
+        o.set("method", req.method)
+        o.set("target", req.target)
+        o.set("type", req.header("Content-Type"))
+        o.set("auth", req.header("Authorization"))
+        o.set("agent", req.header("X-Agent"))
+        o.set("body", req.body())
+        return HttpResponse.json(200, o)
+    })
+    app.get("/status/:code", fn(req: HttpRequest) -> HttpResponse {
+        return HttpResponse.text(Integer.parseOr(req.param("code"), 500) as int, "status " + req.param("code"))
+    })
+    app.get("/flaky", fn(req: HttpRequest) -> HttpResponse {
+        return Hits.flaky.increment() < 3 ? HttpResponse.text(503, "busy") : HttpResponse.text(200, "fine")
+    })
+    app.get("/slow", fn(req: HttpRequest) -> HttpResponse { Time.sleepMs(300); return HttpResponse.text(200, "slow") })
+    app.get("/moved", fn(req: HttpRequest) -> HttpResponse { return HttpResponse.redirect("/echo", 302) })
+    return app.start("127.0.0.1", 0)
+}
+
+test "JSON, form, raw and multipart bodies; queries, headers and tokens" {
+    let s = server()
+    let base = "http://127.0.0.1:${s.port()}"
+    let j = Fetch.withToken("t0k").withHeader("X-Agent", "grav").post(base + "/echo", {"name": "Ada", "age": 36, "tags": ["a", "b"]})
+    assert(j.ok() && j.successful())
+    assertEq(j.jsonAt("method").asString(), "POST")
+    assertEq(j.jsonAt("type").asString(), "application/json")
+    assertEq(j.jsonAt("auth").asString(), "Bearer t0k")
+    assertEq(j.jsonAt("agent").asString(), "grav")
+    let sent = Json.parse(j.jsonAt("body").asString())
+    assertEq(sent.get("age").asInt(), 36)
+    assertEq(sent.get("tags").size(), 2)
+    let f = Fetch.asForm().put(base + "/echo", {"city": "London & Paris"})
+    assertEq(f.jsonAt("type").asString(), "application/x-www-form-urlencoded")
+    assertEq(f.jsonAt("body").asString(), "city=London%20%26%20Paris")
+    let raw = Fetch.request().withBody("<x/>", "application/xml").post(base + "/echo")
+    assertEq(raw.jsonAt("body").asString(), "<x/>")
+    let mp = Fetch.request().attach("file", Bytes.fromString("hello"), "a.txt", "text/plain").post(base + "/echo", {"note": "hi"})
+    assert(Str.startsWith(mp.jsonAt("type").asString(), "multipart/form-data"))
+    assert(Str.contains(mp.jsonAt("body").asString(), "hello") && Str.contains(mp.jsonAt("body").asString(), "hi"))
+    let q = Fetch.baseUrl(base).withQuery({"a": "1"}).get("echo", {"b": "x y"})
+    assertEq(q.jsonAt("target").asString(), "/echo?a=1&b=x%20y")
+    let basic = Fetch.withBasicAuth("ada", "secret").get(base + "/echo")
+    assertEq(basic.jsonAt("auth").asString(), "Basic " + Base64.encode("ada:secret"))
+    s.stop()
+}
+
+test "statuses, failures and redirects" {
+    let s = server()
+    let base = "http://127.0.0.1:${s.port()}"
+    let nf = Fetch.get(base + "/status/404")
+    assert(nf.notFound() && nf.clientError() && nf.failed() && !nf.serverError())
+    let threw = false
+    try { Fetch.get(base + "/status/500").throwIfFailed() } catch (e: HttpClientException) { threw = e.status() == 500 && Str.contains(e.message(), "status 500") }
+    assert(threw)
+    assertEq(Fetch.get(base + "/moved").jsonAt("method").asString(), "GET")       // followed
+    assertEq(Fetch.request().withoutRedirecting().get(base + "/moved").status, 302)
+    let down = false
+    try { Fetch.timeoutMs(1000).get("http://127.0.0.1:1/") } catch (e: HttpClientException) { down = e.response == null }
+    assert(down)
+    s.stop()
+}
+
+test "retries, with backoff, and when they run out" {
+    let s = server()
+    let base = "http://127.0.0.1:${s.port()}"
+    Hits.flaky = new AtomicInt(0)
+    let t0 = Time.monotonicMs()
+    let ok = Fetch.retry(3, 50).get(base + "/flaky")
+    assertEq(ok.body(), "fine")
+    assert(Time.monotonicMs() - t0 >= 100)                    // two waits of 50 ms
+    let gaveUp = false
+    try { Fetch.retry(2, 10).get(base + "/status/503") } catch (e: HttpClientException) { gaveUp = e.status() == 503 }
+    assert(gaveUp)
+    let quiet = Fetch.request().retry(2, 0, null, false).get(base + "/status/503")
+    assertEq(quiet.status, 503)                               // no throw when asked not to
+    let no404 = 0
+    let r = Fetch.request().retry(3, 0, fn(res: ClientResponse, e: Exception) -> bool { no404 += 1; return false }, false).get(base + "/status/404")
+    assertEq(r.status, 404)
+    assertEq(no404, 1)                                        // asked once, said no
+    s.stop()
+}
+
+test "timeouts" {
+    let s = server()
+    let slow = false
+    try { Fetch.timeoutMs(100).get("http://127.0.0.1:${s.port()}/slow") } catch (e: HttpClientException) { slow = true }
+    assert(slow)
+    s.stop()
+}
+
+test "a pool sends its requests at the same time" {
+    let s = server()
+    let base = "http://127.0.0.1:${s.port()}"
+    let t0 = Time.monotonicMs()
+    let all = Fetch.pool(fn(p: HttpPool) {
+        for (i in 0..6) { p.add("slow" + str(i)).get(base + "/slow") }
+        p.add("echo").acceptJson().post(base + "/echo", {"x": 1})
+        p.add("down").timeoutMs(500).get("http://127.0.0.1:1/")
+    })
+    let ms = Time.monotonicMs() - t0
+    assert(ms < 1200)                                         // six 300 ms requests, not one after another
+    assertEq(all.size(), 8)
+    assertEq(all.get("slow3").body(), "slow")
+    assertEq(all.get("echo").jsonAt("method").asString(), "POST")
+    assert(all.get("down") == null && all.errors[7] != null)
+    assert(!all.allSuccessful())
+    s.stop()
+}
+
+test "fakes: patterns, sequences, handlers, stray requests and assertions" {
+    Fetch.reset()
+    Fetch.fake("api.example.com/users*", Fetch.response({"data": [{"name": "Ada"}]}, 200))
+    Fetch.fake("api.example.com/flaky", Fetch.sequence().pushStatus(503).push("ok"))
+    Fetch.fakeUsing("api.example.com/echo*", fn(r: ClientRequest) -> ClientResponse { return Fetch.reply({"got": r.field("name")}, 201) })
+    let u = Fetch.get("https://api.example.com/users", {"page": "2"})
+    assertEq(u.jsonAt("data.0.name").asString(), "Ada")
+    assertEq(Fetch.retry(2).get("https://api.example.com/flaky").body(), "ok")
+    let e = Fetch.post("https://api.example.com/echo", {"name": "Bo"})
+    assertEq(e.status, 201)
+    assertEq(e.jsonAt("got").asString(), "Bo")
+    Fetch.assertSent(fn(r: ClientRequest) -> bool { return Str.contains(r.url, "/users") && r.query("page") == "2" })
+    Fetch.assertSent(fn(r: ClientRequest) -> bool { return r.method == "POST" && r.isJson() && r.field("name") == "Bo" })
+    Fetch.assertNotSent(fn(r: ClientRequest) -> bool { return r.method == "DELETE" })
+    Fetch.assertSentCount(4)                                   // users, flaky twice, echo
+    Fetch.preventStrayRequests()
+    let stray = false
+    try { Fetch.get("https://elsewhere.example.org/") } catch (x: HttpClientException) { stray = Str.contains(x.message(), "stray") }
+    assert(stray)
+    Fetch.reset()
+    Fetch.fake()
+    assertEq(Fetch.get("https://anything.example/").status, 200)  // everything: an empty 200
+    Fetch.reset()
+    Fetch.assertNothingSent()
+    assert(HttpFactory.urlMatches("api.example.com/*", "https://api.example.com/v1/x"))
+    assert(!HttpFactory.urlMatches("api.example.com/*", "https://other.example.com/v1"))
+}
