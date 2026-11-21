@@ -28,7 +28,10 @@ fn server() -> HttpServer {
     app.get("/flaky", fn(req: HttpRequest) -> HttpResponse {
         return Hits.flaky.increment() < 3 ? HttpResponse.text(503, "busy") : HttpResponse.text(200, "fine")
     })
-    app.get("/slow", fn(req: HttpRequest) -> HttpResponse { Time.sleepMs(300); return HttpResponse.text(200, "slow") })
+    app.get("/slow", fn(req: HttpRequest) -> HttpResponse {
+        Time.sleepMs(300)
+        return HttpResponse.text(200, "slow")
+    })
     app.get("/moved", fn(req: HttpRequest) -> HttpResponse { return HttpResponse.redirect("/echo", 302) })
     return app.start("127.0.0.1", 0)
 }
@@ -90,7 +93,10 @@ test "retries, with backoff, and when they run out" {
     let quiet = Fetch.request().retry(2, 0, null, false).get(base + "/status/503")
     assertEq(quiet.status, 503)                               // no throw when asked not to
     let no404 = 0
-    let r = Fetch.request().retry(3, 0, fn(res: ClientResponse, e: Exception) -> bool { no404 += 1; return false }, false).get(base + "/status/404")
+    let r = Fetch.request().retry(3, 0, fn(res: ClientResponse, e: Exception) -> bool {
+        no404 += 1
+        return false
+    }, false).get(base + "/status/404")
     assertEq(r.status, 404)
     assertEq(no404, 1)                                        // asked once, said no
     s.stop()
