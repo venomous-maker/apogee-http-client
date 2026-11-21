@@ -1,0 +1,607 @@
+// http_client.grav — outgoing HTTP for Apogee apps: a fluent request builder
+// over the standard library's HttpClient, with JSON and form bodies, files,
+// retries with backoff, timeouts, concurrent pools, and fakes so tests never
+// touch the network.
+//
+//   let res = Fetch.withToken(token).acceptJson().retry(3, 100).get("https://api.example.com/users", {"page": "2"})
+//   if (res.ok()) { for (u in res.json().get("data").asArray()) { ... } }
+//   Fetch.post("https://api.example.com/users", {"name": "Ada"}).throwIfFailed()
+//
+//   let all = Fetch.pool(fn(p: HttpPool) {
+//       p.add("users").get("https://api.example.com/users")
+//       p.add("orders").get("https://api.example.com/orders")
+//   })                                              // both at once
+//   all.get("users").json()
+//
+//   Fetch.fake({"api.example.com/*": Fetch.response({"ok": true}, 200)})   // in a test
+//   ...
+//   Fetch.assertSent(fn(r: ClientRequest) -> bool { return r.url == "https://api.example.com/users" && r.isJson() })
+import "std"
+import "std/net"
+
+namespace apogee {
+
+    // A request failed: a status of 400 or more (throwIfFailed, or retries that
+    // ran out), or the connection itself (`response` null then).
+    class HttpClientException extends Exception {
+        public response: ClientResponse
+        constructor(message: string, response: ClientResponse) { super(message); self.response = response; }
+        fn status() -> int { return self.response == null ? 0 : self.response.status; }
+        fn kind() -> string { return "HttpClientException"; }
+    }
+
+    // A response.
+    class ClientResponse {
+        public status: int
+        public headers: Headers
+        public bodyBytes: Bytes
+        // The request it answers.
+        public request: ClientRequest
+        // How long the whole call took (retries and all), in milliseconds.
+        public elapsedMs: long = 0
+        private parsed: JsonValue = null
+
+        constructor(status: int, headers: Headers, body: Bytes) { self.status = status; self.headers = headers; self.bodyBytes = body; }
+        static fn of(r: HttpResponse) -> ClientResponse { return new ClientResponse(r.status, r.headers, r.bodyBytes); }
+
+        fn body() -> string { return self.bodyBytes.toString(); }
+        fn header(name: string) -> string { return self.headers.get(name); }
+        // The body as JSON (ValueError when it is not).
+        fn json() -> JsonValue {
+            if (self.parsed == null) { self.parsed = Json.parse(self.body()); }
+            return self.parsed;
+        }
+        // The JSON value at a dotted path ("data.0.name"), or null.
+        fn jsonAt(path: string) -> JsonValue {
+            let cur = self.json();
+            for (seg in Str.split(path, ".")) {
+                if (cur == null) { return null; }
+                if (cur.isObject()) { cur = cur.has(seg) ? cur.get(seg) : null; }
+                else if (cur.isArray()) {
+                    let i = Integer.parseOr(seg, -1) as int;
+                    cur = i >= 0 && i < cur.size() ? cur.at(i) : null;
+                } else { return null; }
+            }
+            return cur;
+        }
+        fn ok() -> bool { return self.status == 200; }
+        fn successful() -> bool { return self.status >= 200 && self.status < 300; }
+        fn redirect() -> bool { return self.status >= 300 && self.status < 400; }
+        fn failed() -> bool { return self.status >= 400; }
+        fn clientError() -> bool { return self.status >= 400 && self.status < 500; }
+        fn serverError() -> bool { return self.status >= 500; }
+        fn notFound() -> bool { return self.status == 404; }
+        fn unauthorized() -> bool { return self.status == 401; }
+        fn forbidden() -> bool { return self.status == 403; }
+        fn tooManyRequests() -> bool { return self.status == 429; }
+        // This response, or HttpClientException when it failed.
+        fn throwIfFailed() -> ClientResponse {
+            if (self.failed()) {
+                let b = self.body();
+                throw new HttpClientException("HTTP ${self.status} from " + (self.request == null ? "the server" : self.request.method + " " + self.request.url) +
+                                              (b == "" ? "" : ": " + (b.length > 300 ? b[..300] + "..." : b)), self);
+            }
+            return self;
+        }
+    }
+
+    // A request as it was sent (what fakes are given, and assertSent looks at).
+    class ClientRequest {
+        public method: string
+        public url: string
+        public headers: Headers
+        public body: Bytes
+        public contentType: string
+        constructor(method: string, url: string, headers: Headers, body: Bytes, contentType: string) {
+            self.method = method; self.url = url; self.headers = headers; self.body = body == null ? new Bytes() : body; self.contentType = contentType;
+        }
+        fn header(name: string) -> string { return self.headers.get(name); }
+        fn hasHeader(name: string, value: string = "") -> bool {
+            return self.headers.has(name) && (value == "" || self.headers.get(name) == value);
+        }
+        fn bodyText() -> string { return self.body.toString(); }
+        fn isJson() -> bool { return Str.contains(self.contentType, "json"); }
+        fn isForm() -> bool { return Str.contains(self.contentType, "x-www-form-urlencoded"); }
+        fn isMultipart() -> bool { return Str.contains(self.contentType, "multipart/"); }
+        // The JSON body (null when it is not JSON).
+        fn json() -> JsonValue { return self.isJson() ? Json.tryParse(self.bodyText()) : null; }
+        // A field of a JSON or form body ("" when absent).
+        fn field(name: string) -> string {
+            if (self.isJson()) {
+                let j = self.json();
+                if (j == null || !j.isObject() || !j.has(name)) { return ""; }
+                let v = j.get(name);
+                return v.isString() ? v.asString() : v.toJson();
+            }
+            if (self.isForm()) {
+                for (pair in Str.split(self.bodyText(), "&")) {
+                    let eq = Str.indexOf(pair, "=");
+                    if (eq > 0 && Url.decode(pair[..eq]) == name) { return Url.decode(pair[eq + 1..]); }
+                }
+            }
+            return "";
+        }
+        // A query string parameter ("" when absent).
+        fn query(name: string) -> string {
+            let q = Str.indexOf(self.url, "?");
+            if (q < 0) { return ""; }
+            for (pair in Str.split(self.url[q + 1..], "&")) {
+                let eq = Str.indexOf(pair, "=");
+                let k = eq < 0 ? pair : pair[..eq];
+                if (Url.decode(k) == name) { return eq < 0 ? "" : Url.decode(pair[eq + 1..]); }
+            }
+            return "";
+        }
+    }
+
+    // What a fake answers: one response, or a sequence of them.
+    class FakeResponder {
+        public responses: Array<ClientResponse>
+        private next: int = 0
+        // After the sequence: this (null: the last again), when made by sequence().
+        public whenEmpty: ClientResponse = null
+        public isSequence: bool = false
+        private lock: Mutex = new Mutex()
+        constructor() { self.responses = new Array<ClientResponse>(); }
+        // Adds a response to a sequence.
+        fn push(body: any = "", status: int = 200, headers: HashMap<string, string> = null) -> FakeResponder {
+            self.responses.push(Fetch.response(body, status, headers).responses[0]);
+            return self;
+        }
+        fn pushStatus(status: int) -> FakeResponder { return self.push("", status); }
+        // Once the sequence is used up, answer with this.
+        fn whenEmptyRespond(body: any = "", status: int = 200) -> FakeResponder { self.whenEmpty = Fetch.response(body, status).responses[0]; return self; }
+        fn take() -> ClientResponse {
+            self.lock.lock();
+            let r: ClientResponse = null;
+            if (self.next < self.responses.size()) { r = self.responses[self.next]; self.next += 1; }
+            else if (self.isSequence && self.whenEmpty != null) { r = self.whenEmpty; }
+            else if (!self.isSequence && self.responses.size() > 0) { r = self.responses[self.responses.size() - 1]; }
+            self.lock.unlock();
+            if (r == null) { throw new StateError("the fake response sequence is used up"); }
+            return new ClientResponse(r.status, r.headers.copy(), r.bodyBytes.copy());
+        }
+    }
+
+    // One fake: the URLs it answers ("api.example.com/*", "*") and how.
+    class FakeRoute {
+        public pattern: string
+        public responder: FakeResponder
+        public handler: fn(ClientRequest) -> ClientResponse
+        constructor(pattern: string) { self.pattern = pattern; self.responder = null; self.handler = null; }
+    }
+
+    // Makes requests (holds the shared clients, fakes and what was recorded).
+    // Fetch's statics use one; an app may make its own.
+    class HttpFactory {
+        // Headers every request gets.
+        public globalHeaders: Headers = new Headers()
+        public faking: bool = false
+        public preventStray: bool = false
+        public recorded: Array<ClientRequest> = new Array<ClientRequest>()
+        private routes: Array<FakeRoute> = new Array<FakeRoute>()
+        private idle: Array<HttpClient> = new Array<HttpClient>()
+        private lock: Mutex = new Mutex()
+
+        fn request() -> PendingRequest { return new PendingRequest(self); }
+
+        // ── fakes ──────────────────────────────────────────────────────────────
+        // Answers matching requests with `responder`; with nothing given, every
+        // request gets an empty 200.
+        fn fake(pattern: string = "*", responder: FakeResponder = null) {
+            self.lock.lock();
+            self.faking = true;
+            let r = new FakeRoute(pattern);
+            r.responder = responder == null ? Fetch.response("", 200) : responder;
+            self.routes.push(r);
+            self.lock.unlock();
+        }
+        // Answers matching requests with what `handler` returns for them.
+        fn fakeUsing(pattern: string, handler: fn(ClientRequest) -> ClientResponse) {
+            self.lock.lock();
+            self.faking = true;
+            let r = new FakeRoute(pattern);
+            r.handler = handler;
+            self.routes.push(r);
+            self.lock.unlock();
+        }
+        fn fakeAll(routes: HashMap<string, FakeResponder>) { for ((p, r) in routes) { self.fake(p, r); } }
+        // Requests no fake matches throw instead of going out.
+        fn preventStrayRequests(on: bool = true) { self.preventStray = on; self.faking = self.faking || on; }
+        // Back to real requests; forgets the fakes and the record.
+        fn reset() {
+            self.lock.lock();
+            self.faking = false;
+            self.preventStray = false;
+            self.routes.clear();
+            self.recorded.clear();
+            self.lock.unlock();
+        }
+        // The fake's answer for `r`, or null when no fake matches it.
+        fn fakeFor(r: ClientRequest) -> ClientResponse {
+            self.lock.lock();
+            self.recorded.push(r);
+            let match: FakeRoute = null;
+            for (route in self.routes) { if (HttpFactory.urlMatches(route.pattern, r.url)) { match = route; } }  // (the last that matches)
+            self.lock.unlock();
+            if (match == null) {
+                if (self.preventStray) { throw new HttpClientException("no fake for " + r.method + " " + r.url + " (stray requests are prevented)", null); }
+                return null;
+            }
+            if (match.handler != null) { let h = match.handler; return h(r); }
+            return match.responder.take();
+        }
+        // `pattern` (* matches anything; a leading * is implied) against a URL.
+        static fn urlMatches(pattern: string, url: string) -> bool {
+            let p = Str.startsWith(pattern, "*") ? pattern : "*" + pattern;
+            return HttpFactory.glob(p, 0, url, 0);
+        }
+        private static fn glob(p: string, pi: int, s: string, si: int) -> bool {
+            let i = pi;
+            let j = si;
+            let star = -1;
+            let mark = 0;
+            while (j < s.length) {
+                if (i < p.length && p[i] != ('*' as byte) && p[i] == s[j]) { i += 1; j += 1; }
+                else if (i < p.length && p[i] == ('*' as byte)) { star = i; mark = j; i += 1; }
+                else if (star >= 0) { i = star + 1; mark += 1; j = mark; }
+                else { return false; }
+            }
+            while (i < p.length && p[i] == ('*' as byte)) { i += 1; }
+            return i == p.length;
+        }
+
+        // ── assertions (for tests) ─────────────────────────────────────────────
+        fn sent(where: fn(ClientRequest) -> bool) -> Array<ClientRequest> {
+            self.lock.lock();
+            let out = self.recorded.filter(where);
+            self.lock.unlock();
+            return out;
+        }
+        fn assertSent(where: fn(ClientRequest) -> bool) {
+            if (self.sent(where).size() == 0) { throw new StateError("expected a request that matches, but none was sent (${self.recorded.size()} sent)"); }
+        }
+        fn assertNotSent(where: fn(ClientRequest) -> bool) {
+            if (self.sent(where).size() > 0) { throw new StateError("expected no request that matches, but one was sent"); }
+        }
+        fn assertSentCount(n: int) {
+            if (self.recorded.size() != n) { throw new StateError("expected ${n} requests, but ${self.recorded.size()} were sent"); }
+        }
+        fn assertNothingSent() { self.assertSentCount(0); }
+
+        // ── the real client pool ───────────────────────────────────────────────
+        fn takeClient() -> HttpClient {
+            self.lock.lock();
+            let c = self.idle.isEmpty() ? null : self.idle.pop();
+            self.lock.unlock();
+            return c == null ? new HttpClient() : c;
+        }
+        fn giveBack(c: HttpClient) {
+            self.lock.lock();
+            if (self.idle.size() < 32) { self.idle.push(c); }
+            self.lock.unlock();
+        }
+    }
+
+    // A request being built; its verbs send it.
+    class PendingRequest {
+        private factory: HttpFactory
+        private headers: Headers
+        private query: Array<string>          // encoded "k=v"
+        private base: string = ""
+        private bodyKind: string = "json"     // "json", "form", "multipart", "raw"
+        private rawBody: Bytes = null
+        private rawType: string = ""
+        private form: FormData = null
+        private timeout: int = 30000
+        private tries: int = 1
+        private sleepMs: long = 0
+        private exponential: bool = false
+        private retryWhen: fn(ClientResponse, Exception) -> bool = null
+        private throwAfterRetries: bool = true
+        private redirects: int = 5
+
+        constructor(factory: HttpFactory) {
+            self.factory = factory;
+            self.headers = factory.globalHeaders.copy();
+            self.query = new Array<string>();
+        }
+
+        // ── options ────────────────────────────────────────────────────────────
+        fn baseUrl(url: string) -> PendingRequest { self.base = Str.endsWith(url, "/") ? url[..url.length - 1] : url; return self; }
+        fn withHeader(name: string, value: string) -> PendingRequest { self.headers.set(name, value); return self; }
+        fn withHeaders(h: HashMap<string, string>) -> PendingRequest { for ((k, v) in h) { self.headers.set(k, v); } return self; }
+        fn withToken(token: string, kind: string = "Bearer") -> PendingRequest { return self.withHeader("Authorization", kind + " " + token); }
+        fn withBasicAuth(user: string, password: string) -> PendingRequest {
+            return self.withHeader("Authorization", "Basic " + Base64.encode(user + ":" + password));
+        }
+        fn withUserAgent(ua: string) -> PendingRequest { return self.withHeader("User-Agent", ua); }
+        fn accept(type: string) -> PendingRequest { return self.withHeader("Accept", type); }
+        fn acceptJson() -> PendingRequest { return self.accept("application/json"); }
+        fn withQuery(params: HashMap<string, string>) -> PendingRequest {
+            for ((k, v) in params) { self.query.push(Url.encode(k) + "=" + Url.encode(v)); }
+            return self;
+        }
+        // Bodies: JSON (the default), a form, or as given.
+        fn asJson() -> PendingRequest { self.bodyKind = "json"; return self; }
+        fn asForm() -> PendingRequest { self.bodyKind = "form"; return self; }
+        fn withBody(body: string, contentType: string) -> PendingRequest {
+            self.bodyKind = "raw";
+            self.rawBody = Bytes.fromString(body);
+            self.rawType = contentType;
+            return self;
+        }
+        // A file in a multipart body (the data's other fields go in as fields).
+        fn attach(name: string, contents: Bytes, filename: string, contentType: string = "application/octet-stream") -> PendingRequest {
+            if (self.form == null) { self.form = new FormData(); }
+            self.form.addFile(name, filename, contentType, contents);
+            self.bodyKind = "multipart";
+            return self;
+        }
+        fn timeoutMs(ms: int) -> PendingRequest { self.timeout = ms; return self; }
+        fn timeoutSeconds(s: int) -> PendingRequest { self.timeout = s * 1000; return self; }
+        fn withoutRedirecting() -> PendingRequest { self.redirects = 0; return self; }
+        fn maxRedirects(n: int) -> PendingRequest { self.redirects = n; return self; }
+        // Tries up to `times` times in all, waiting `sleepMs` between tries
+        // (doubling each time with `exponential`). By default it tries again
+        // after a connection error, a 5xx or a 429; `when` decides otherwise
+        // (it gets the response, or null and the exception). When the last try
+        // still fails, it throws HttpClientException unless `throwOnFailure` is false.
+        fn retry(times: int, sleepMs: long = 0, when: fn(ClientResponse, Exception) -> bool = null,
+                 throwOnFailure: bool = true, exponential: bool = false) -> PendingRequest {
+            self.tries = times < 1 ? 1 : times;
+            self.sleepMs = sleepMs;
+            self.retryWhen = when;
+            self.throwAfterRetries = throwOnFailure;
+            self.exponential = exponential;
+            return self;
+        }
+
+        // ── verbs ──────────────────────────────────────────────────────────────
+        fn get(url: string, query: HashMap<string, string> = null) -> ClientResponse { return self.send("GET", url, null, query); }
+        fn head(url: string, query: HashMap<string, string> = null) -> ClientResponse { return self.send("HEAD", url, null, query); }
+        fn delete(url: string, data: any = null) -> ClientResponse { return self.send("DELETE", url, data, null); }
+        fn post(url: string, data: any = null) -> ClientResponse { return self.send("POST", url, data, null); }
+        fn put(url: string, data: any = null) -> ClientResponse { return self.send("PUT", url, data, null); }
+        fn patch(url: string, data: any = null) -> ClientResponse { return self.send("PATCH", url, data, null); }
+
+        // Any method.
+        fn send(method: string, url: string, data: any, query: HashMap<string, string>) -> ClientResponse {
+            let full = self.base != "" && !Str.contains(url, "://") ? self.base + (Str.startsWith(url, "/") ? url : "/" + url) : url;
+            let qs = self.query.copy();
+            if (query != null) { for ((k, v) in query) { qs.push(Url.encode(k) + "=" + Url.encode(v)); } }
+            if (qs.size() > 0) { full = full + (Str.contains(full, "?") ? "&" : "?") + Str.join(qs, "&"); }
+            let body: Bytes = null;
+            let type = "";
+            let m = Str.upper(method);
+            if (self.bodyKind == "raw") { body = self.rawBody; type = self.rawType; }
+            else if (self.bodyKind == "multipart") {
+                let f = self.form;
+                if (data is HashMap<string, any>) { for ((k, v) in data as HashMap<string, any>) { f.add(k, str(v)); } }
+                if (data is HashMap<string, string>) { for ((k, v) in data as HashMap<string, string>) { f.add(k, v); } }
+                body = f.body();
+                type = f.contentType();
+            } else if (data != null && m != "GET" && m != "HEAD") {
+                if (self.bodyKind == "form") { body = Bytes.fromString(PendingRequest.formEncode(data)); type = "application/x-www-form-urlencoded"; }
+                else { body = Bytes.fromString(JsonBody.encode(data)); type = "application/json"; }
+            }
+            let req = new ClientRequest(m, full, self.headers.copy(), body, type);
+            let started = Time.monotonicMs();
+            let wait = self.sleepMs;
+            let attempt = 1;
+            while (true) {
+                let res: ClientResponse = null;
+                let error: Exception = null;
+                try { res = self.once(req); } catch (e: HttpClientException) { throw e; } catch (e: Exception) { error = e; }
+                let again = false;
+                if (attempt < self.tries) {
+                    let when = self.retryWhen;
+                    again = when != null ? when(res, error) : (error != null || res.serverError() || res.tooManyRequests());
+                }
+                if (!again) {
+                    if (error != null) { throw new HttpClientException(m + " " + full + " failed: " + error.message(), null); }
+                    res.request = req;
+                    res.elapsedMs = Time.monotonicMs() - started;
+                    if (self.tries > 1 && self.throwAfterRetries && res.failed()) { res.throwIfFailed(); }
+                    return res;
+                }
+                if (wait > 0) { Time.sleepMs(wait); }
+                if (self.exponential) { wait = wait * 2; }
+                attempt += 1;
+            }
+            return null;
+        }
+        // One try: a fake's answer, or the network's.
+        private fn once(req: ClientRequest) -> ClientResponse {
+            if (self.factory.faking) {
+                let fake = self.factory.fakeFor(req);
+                if (fake != null) { fake.request = req; return fake; }
+            }
+            let c = self.factory.takeClient();
+            c.timeoutMs = self.timeout;
+            c.maxRedirects = self.redirects;
+            let res = c.send(req.method, req.url, req.body.size() == 0 && req.contentType == "" ? null : req.body, req.contentType, req.headers);
+            self.factory.giveBack(c);
+            return ClientResponse.of(res);
+        }
+
+        static fn formEncode(data: any) -> string {
+            let parts = new Array<string>();
+            if (data is HashMap<string, any>) { for ((k, v) in data as HashMap<string, any>) { parts.push(Url.encode(k) + "=" + Url.encode(str(v))); } }
+            else if (data is HashMap<string, string>) { for ((k, v) in data as HashMap<string, string>) { parts.push(Url.encode(k) + "=" + Url.encode(v)); } }
+            else { return str(data); }
+            return Str.join(parts, "&");
+        }
+    }
+
+    // JSON-plain values (null, bool, numbers, strings, Array<any>, HashMap of
+    // those, JsonValue) as JSON text.
+    class JsonBody {
+        static fn encode(v: any) -> string { return JsonBody.of(v).toJson(); }
+        static fn of(v: any) -> JsonValue {
+            if (v == null) { return Json.nil(); }
+            if (v is JsonValue) { return v as JsonValue; }
+            if (v is bool) { return Json.of(v as bool); }
+            if (v is long) { return Json.of(v as long); }
+            if (v is int) { return Json.of((v as int) as long); }
+            if (v is float) { return Json.of(v as float); }
+            if (v is double) { return Json.of(v as double); }
+            if (v is string) { return Json.of(v as string); }
+            if (v is HashMap<string, any>) {
+                let o = Json.object();
+                for ((k, x) in v as HashMap<string, any>) { o.set(k, JsonBody.of(x)); }
+                return o;
+            }
+            if (v is HashMap<string, string>) {
+                let o = Json.object();
+                for ((k, x) in v as HashMap<string, string>) { o.set(k, x); }
+                return o;
+            }
+            if (v is Array<any>) {
+                let a = Json.array();
+                for (x in v as Array<any>) { a.push(JsonBody.of(x)); }
+                return a;
+            }
+            return Json.of(str(v));
+        }
+    }
+
+    // Requests sent at the same time: each add() starts one (named, to find its
+    // response by name), and Fetch.pool returns when all have answered.
+    class HttpPool {
+        public factory: HttpFactory
+        public names: Array<string> = new Array<string>()
+        public makers: Array<fn() -> ClientResponse> = new Array<fn() -> ClientResponse>()
+        constructor(factory: HttpFactory) { self.factory = factory; }
+        // A request in the pool, called `name` ("" for none).
+        fn add(name: string = "") -> PoolRequest { return new PoolRequest(self, name); }
+    }
+
+    // A request added to a pool: its verbs queue it (they run when the pool does).
+    class PoolRequest {
+        private pool: HttpPool
+        private name: string
+        public request: PendingRequest
+        constructor(pool: HttpPool, name: string) { self.pool = pool; self.name = name; self.request = pool.factory.request(); }
+        // Options, as on any request.
+        fn withHeader(n: string, v: string) -> PoolRequest { self.request.withHeader(n, v); return self; }
+        fn withToken(t: string) -> PoolRequest { self.request.withToken(t); return self; }
+        fn acceptJson() -> PoolRequest { self.request.acceptJson(); return self; }
+        fn timeoutMs(ms: int) -> PoolRequest { self.request.timeoutMs(ms); return self; }
+        fn retry(times: int, sleepMs: long = 0) -> PoolRequest { self.request.retry(times, sleepMs); return self; }
+        fn get(url: string, query: HashMap<string, string> = null) { self.queue(fn() -> ClientResponse { return self.request.get(url, query); }); }
+        fn post(url: string, data: any = null) { self.queue(fn() -> ClientResponse { return self.request.post(url, data); }); }
+        fn put(url: string, data: any = null) { self.queue(fn() -> ClientResponse { return self.request.put(url, data); }); }
+        fn patch(url: string, data: any = null) { self.queue(fn() -> ClientResponse { return self.request.patch(url, data); }); }
+        fn delete(url: string, data: any = null) { self.queue(fn() -> ClientResponse { return self.request.delete(url, data); }); }
+        private fn queue(f: fn() -> ClientResponse) {
+            self.pool.names.push(self.name);
+            self.pool.makers.push(f);
+        }
+    }
+
+    // A pool's responses, in the order the requests were added, and by name.
+    class PoolResponses {
+        public responses: Array<ClientResponse> = new Array<ClientResponse>()
+        // An exception per request that could not be sent (null when it was).
+        public errors: Array<Exception> = new Array<Exception>()
+        public names: Array<string> = new Array<string>()
+        fn at(i: int) -> ClientResponse { return self.responses[i]; }
+        fn size() -> int { return self.responses.size(); }
+        // The response of the request called `name` (null when it failed or there is none).
+        fn get(name: string) -> ClientResponse {
+            let i = self.names.indexOf(name);
+            return i < 0 ? null : self.responses[i];
+        }
+        fn allSuccessful() -> bool {
+            for (i in 0..self.responses.size()) { if (self.responses[i] == null || !self.responses[i].successful()) { return false; } }
+            return true;
+        }
+    }
+
+    // The app's HTTP client, as statics.
+    class Fetch {
+        private static factory: HttpFactory = new HttpFactory()
+        static fn instance() -> HttpFactory { return Fetch.factory; }
+        static fn use(f: HttpFactory) { Fetch.factory = f; }
+
+        // A new request (options chain from it).
+        static fn request() -> PendingRequest { return Fetch.factory.request(); }
+        static fn baseUrl(url: string) -> PendingRequest { return Fetch.request().baseUrl(url); }
+        static fn withHeaders(h: HashMap<string, string>) -> PendingRequest { return Fetch.request().withHeaders(h); }
+        static fn withHeader(n: string, v: string) -> PendingRequest { return Fetch.request().withHeader(n, v); }
+        static fn withToken(token: string, kind: string = "Bearer") -> PendingRequest { return Fetch.request().withToken(token, kind); }
+        static fn withBasicAuth(user: string, password: string) -> PendingRequest { return Fetch.request().withBasicAuth(user, password); }
+        static fn acceptJson() -> PendingRequest { return Fetch.request().acceptJson(); }
+        static fn asForm() -> PendingRequest { return Fetch.request().asForm(); }
+        static fn timeoutMs(ms: int) -> PendingRequest { return Fetch.request().timeoutMs(ms); }
+        static fn retry(times: int, sleepMs: long = 0) -> PendingRequest { return Fetch.request().retry(times, sleepMs); }
+        static fn get(url: string, query: HashMap<string, string> = null) -> ClientResponse { return Fetch.request().get(url, query); }
+        static fn head(url: string) -> ClientResponse { return Fetch.request().head(url); }
+        static fn post(url: string, data: any = null) -> ClientResponse { return Fetch.request().post(url, data); }
+        static fn put(url: string, data: any = null) -> ClientResponse { return Fetch.request().put(url, data); }
+        static fn patch(url: string, data: any = null) -> ClientResponse { return Fetch.request().patch(url, data); }
+        static fn delete(url: string, data: any = null) -> ClientResponse { return Fetch.request().delete(url, data); }
+
+        // Runs the requests `build` adds, at most `concurrency` at once, and
+        // returns their responses. A request that cannot be sent leaves a null
+        // response and its exception in `errors`.
+        static fn pool(build: fn(HttpPool), concurrency: int = 16) -> PoolResponses {
+            let p = new HttpPool(Fetch.factory);
+            build(p);
+            let n = p.makers.size();
+            let out = new PoolResponses();
+            for (i in 0..n) { out.responses.push(null); out.errors.push(null); out.names.push(p.names[i]); }
+            let nextIndex = new AtomicInt(0);
+            let workers = new Array<Thread>();
+            let threads = n < concurrency ? n : concurrency;
+            let lock = new Mutex();
+            for (t in 0..threads) {
+                workers.push(Thread.spawn(fn() {
+                    while (true) {
+                        let i = (nextIndex.increment() - 1) as int;
+                        if (i >= n) { break; }
+                        let make = p.makers[i];
+                        try {
+                            let r = make();
+                            lock.lock(); out.responses[i] = r; lock.unlock();
+                        } catch (e: Exception) {
+                            lock.lock(); out.errors[i] = e; lock.unlock();
+                        }
+                    }
+                }));
+            }
+            for (w in workers) { w.join(); }
+            return out;
+        }
+
+        // ── fakes ──────────────────────────────────────────────────────────────
+        // A fake response: `body` JSON-plain (encoded as JSON) or a string.
+        static fn response(body: any = "", status: int = 200, headers: HashMap<string, string> = null) -> FakeResponder {
+            let h = new Headers();
+            let text = "";
+            if (body is string) { text = body as string; if (text != "") { h.set("Content-Type", "text/plain; charset=utf-8"); } }
+            else if (body != null) { text = JsonBody.encode(body); h.set("Content-Type", "application/json"); }
+            if (headers != null) { for ((k, v) in headers) { h.set(k, v); } }
+            let r = new FakeResponder();
+            r.responses.push(new ClientResponse(status, h, Bytes.fromString(text)));
+            return r;
+        }
+        // One response, for a fakeUsing handler to return.
+        static fn reply(body: any = "", status: int = 200, headers: HashMap<string, string> = null) -> ClientResponse {
+            return Fetch.response(body, status, headers).take();
+        }
+        // Responses given out one after another (push them on it).
+        static fn sequence() -> FakeResponder { let r = new FakeResponder(); r.isSequence = true; return r; }
+        static fn fake(pattern: string = "*", responder: FakeResponder = null) { Fetch.factory.fake(pattern, responder); }
+        static fn fakeAll(routes: HashMap<string, FakeResponder>) { Fetch.factory.fakeAll(routes); }
+        static fn fakeUsing(pattern: string, handler: fn(ClientRequest) -> ClientResponse) { Fetch.factory.fakeUsing(pattern, handler); }
+        static fn preventStrayRequests(on: bool = true) { Fetch.factory.preventStrayRequests(on); }
+        static fn reset() { Fetch.factory.reset(); }
+        static fn recorded() -> Array<ClientRequest> { return Fetch.factory.recorded; }
+        static fn assertSent(where: fn(ClientRequest) -> bool) { Fetch.factory.assertSent(where); }
+        static fn assertNotSent(where: fn(ClientRequest) -> bool) { Fetch.factory.assertNotSent(where); }
+        static fn assertSentCount(n: int) { Fetch.factory.assertSentCount(n); }
+        static fn assertNothingSent() { Fetch.factory.assertNothingSent(); }
+    }
+}
