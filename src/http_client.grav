@@ -215,7 +215,7 @@ namespace apogee {
                 self.next += 1
             }
             else if (self.isSequence && self.whenEmpty != null) { r = self.whenEmpty; }
-            else if (!self.isSequence && self.responses.size() > 0) { r = self.responses[self.responses.size() - 1]; }
+            else if (!self.isSequence && !self.responses.isEmpty()) { r = self.responses[self.responses.size() - 1]; }
             self.lock.unlock();
             if (r == null) { throw new StateError("the fake response sequence is used up"); }
             return new ClientResponse(r.status, r.headers.copy(), r.bodyBytes.copy());
@@ -343,10 +343,10 @@ namespace apogee {
             return out;
         }
         fn assertSent(where: fn(ClientRequest) -> bool) {
-            if (self.sent(where).size() == 0) { throw new StateError("expected a request that matches, but none was sent (${self.recorded.size()} sent)"); }
+            if (self.sent(where).isEmpty()) { throw new StateError("expected a request that matches, but none was sent (${self.recorded.size()} sent)"); }
         }
         fn assertNotSent(where: fn(ClientRequest) -> bool) {
-            if (self.sent(where).size() > 0) { throw new StateError("expected no request that matches, but one was sent"); }
+            if (!self.sent(where).isEmpty()) { throw new StateError("expected no request that matches, but one was sent"); }
         }
         fn assertSentCount(n: int) {
             if (self.recorded.size() != n) { throw new StateError("expected ${n} requests, but ${self.recorded.size()} were sent"); }
@@ -503,7 +503,7 @@ namespace apogee {
             let full = self.base != "" && !Str.contains(url, "://") ? self.base + (Str.startsWith(url, "/") ? url : "/" + url) : url;
             let qs = self.query.copy();
             if (query != null) { for ((k, v) in query) { qs.push(Url.encode(k) + "=" + Url.encode(v)); } }
-            if (qs.size() > 0) { full = full + (Str.contains(full, "?") ? "&" : "?") + Str.join(qs, "&"); }
+            if (!qs.isEmpty()) { full = full + (Str.contains(full, "?") ? "&" : "?") + Str.join(qs, "&"); }
             let body: Bytes = null;
             let type = "";
             let m = Str.upper(method);
@@ -548,7 +548,7 @@ namespace apogee {
                     return res;
                 }
                 if (wait > 0) { Time.sleepMs(wait); }
-                if (self.exponential) { wait = wait * 2; }
+                if (self.exponential) { wait *= 2; }
                 attempt += 1;
             }
             return null;
