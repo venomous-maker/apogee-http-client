@@ -1,0 +1,6 @@
+name = "apogee-http-client"
+lib = "src/http_client.grav"
+grav = ">=1.10.1"
+paths = ["src"]
+
+[dependencies]
