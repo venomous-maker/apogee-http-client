@@ -6,6 +6,13 @@ compiler versions it builds with.
 
 ## Unreleased
 
+Needs grav 1.13.0 or newer.
+
+- Retries honour a 429's or 503's `Retry-After` (seconds or an HTTP date), and
+  exponential waits are random up to the doubled delay (std's `Retry`), so
+  clients failing together do not come back together. `maxSleepMs` (30 s) caps
+  every wait.
+
 ## 0.1.1 (2026-11-21)
 
 - Laid out by `grav fmt` and tidied as grav 1.11's lints suggest (`isEmpty()`
