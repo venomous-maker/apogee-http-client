@@ -6,7 +6,7 @@ and raw bodies, tokens, retries with backoff, timeouts, requests sent at the
 same time, and fakes so tests never touch the network. The facade is `Fetch`
 (the standard library already has an `Http` class).
 
-```grav
+```typescript
 import "std"
 import "apogee-http-client"
 use apogee.*
@@ -56,7 +56,7 @@ and its exception in `errors`.
 
 ## Fakes
 
-```grav
+```typescript
 Fetch.fake("api.example.com/users*", Fetch.response({"data": []}, 200))
 Fetch.fake("api.example.com/flaky", Fetch.sequence().pushStatus(503).push("ok"))
 Fetch.fakeUsing("api.example.com/echo*", fn(r: ClientRequest) -> ClientResponse { return Fetch.reply({"got": r.field("name")}, 201) })
