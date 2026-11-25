@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.2.0 (2026-11-25)
+
 Needs grav 1.13.0 or newer.
 
 - Retries honour a 429's or 503's `Retry-After` (seconds or an HTTP date), and
