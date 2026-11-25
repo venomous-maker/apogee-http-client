@@ -156,3 +156,26 @@ test "fakes: patterns, sequences, handlers, stray requests and assertions" {
     assert(HttpFactory.urlMatches("api.example.com/*", "https://api.example.com/v1/x"))
     assert(!HttpFactory.urlMatches("api.example.com/*", "https://other.example.com/v1"))
 }
+
+test "retries: a server's Retry-After, capped; jittered exponential waits" {
+    assertEq(PendingRequest.retryAfterMs("2"), 2000 as long)
+    assertEq(PendingRequest.retryAfterMs(""), 0 as long)
+    assertEq(PendingRequest.retryAfterMs("soon"), 0 as long)
+    let later = PendingRequest.retryAfterMs(DateTime.fromUnix(Time.now() + 30).httpDate())
+    assert(later > 25000 && later <= 30000, "${later}")
+    Fetch.reset()
+    let tries = 0
+    Fetch.fakeUsing("api.example.com/busy", fn(r: ClientRequest) -> ClientResponse {
+        tries += 1
+        return tries == 1 ? Fetch.reply("slow down", 429, {"Retry-After": "120"}) : Fetch.reply("ok")
+    })
+    let started = Time.monotonicMs()
+    let res = Fetch.request().retry(2, 0, null, true, false, 50).get("https://api.example.com/busy")
+    assertEq(res.body(), "ok")
+    let took = Time.monotonicMs() - started
+    assert(took >= 45 && took < 1000, "${took} ms")                     // waited, but at most maxSleepMs, not 120 s
+    tries = 0
+    Fetch.fakeUsing("api.example.com/flaky2", fn(r: ClientRequest) -> ClientResponse { tries += 1; return tries < 3 ? Fetch.reply("no", 503) : Fetch.reply("ok") })
+    assertEq(Fetch.request().retry(3, 5, null, true, true, 40).get("https://api.example.com/flaky2").body(), "ok")
+    assertEq(tries, 3)
+}
