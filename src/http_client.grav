@@ -383,6 +383,8 @@ namespace apogee {
         private tries: int = 1
         private sleepMs: long = 0
         private exponential: bool = false
+        // The longest wait between tries (a server's Retry-After included).
+        private maxSleepMs: long = 30000
         private retryWhen: fn(ClientResponse, Exception) -> bool = null
         private throwAfterRetries: bool = true
         private redirects: int = 5
@@ -464,17 +466,21 @@ namespace apogee {
             return self
         }
         // Tries up to `times` times in all, waiting `sleepMs` between tries
-        // (doubling each time with `exponential`). By default it tries again
-        // after a connection error, a 5xx or a 429; `when` decides otherwise
-        // (it gets the response, or null and the exception). When the last try
-        // still fails, it throws HttpClientException unless `throwOnFailure` is false.
+        // (with `exponential`, doubling each time, each wait random up to that:
+        // std's Retry, so clients failing together do not come back together).
+        // A 429 or 503 with a Retry-After header waits as long as the server asks.
+        // No wait is longer than `maxSleepMs`. By default it tries again after a
+        // connection error, a 5xx or a 429; `when` decides otherwise (it gets the
+        // response, or null and the exception). When the last try still fails, it
+        // throws HttpClientException unless `throwOnFailure` is false.
         fn retry(times: int, sleepMs: long = 0, when: fn(ClientResponse, Exception) -> bool = null,
-                 throwOnFailure: bool = true, exponential: bool = false) -> PendingRequest {
+                 throwOnFailure: bool = true, exponential: bool = false, maxSleepMs: long = 30000) -> PendingRequest {
             self.tries = times < 1 ? 1 : times;
             self.sleepMs = sleepMs;
             self.retryWhen = when;
             self.throwAfterRetries = throwOnFailure;
             self.exponential = exponential;
+            self.maxSleepMs = maxSleepMs;
             return self;
         }
 
@@ -529,7 +535,7 @@ namespace apogee {
             }
             let req = new ClientRequest(m, full, self.headers.copy(), body, type);
             let started = Time.monotonicMs();
-            let wait = self.sleepMs;
+            let backoff = new Retry(self.tries, self.sleepMs, self.maxSleepMs < self.sleepMs ? self.sleepMs : self.maxSleepMs);
             let attempt = 1;
             while (true) {
                 let res: ClientResponse = null;
@@ -547,11 +553,27 @@ namespace apogee {
                     if (self.tries > 1 && self.throwAfterRetries && res.failed()) { res.throwIfFailed(); }
                     return res;
                 }
+                let wait = self.exponential ? backoff.delayFor(attempt) : self.sleepMs;
+                if (res != null && (res.status == 429 || res.status == 503)) {
+                    let asked = PendingRequest.retryAfterMs(res.header("Retry-After"));
+                    if (asked > wait) { wait = asked; }
+                }
+                if (wait > self.maxSleepMs && self.maxSleepMs > 0) { wait = self.maxSleepMs; }
                 if (wait > 0) { Time.sleepMs(wait); }
-                if (self.exponential) { wait *= 2; }
                 attempt += 1;
             }
             return null;
+        }
+        // A Retry-After header's wait in milliseconds: seconds, or an HTTP date (0: none).
+        static fn retryAfterMs(value: string) -> long {
+            let v = Str.trim(value);
+            if (v == "") { return 0; }
+            if (Str.isDigits(v)) { return Format.toLongOr(v, 0) * 1000; }
+            let at: DateTime = null;
+            try { at = DateTime.parseHttpDate(v); } catch (e: Exception) { return 0; }
+            if (at == null) { return 0; }
+            let ms = (at.unix() - Time.now()) * 1000;
+            return ms > 0 ? ms : 0 as long;
         }
         // One try: a fake's answer, or the network's.
         private fn once(req: ClientRequest) -> ClientResponse {
